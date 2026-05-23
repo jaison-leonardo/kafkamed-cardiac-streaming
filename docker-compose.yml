@@ -1,0 +1,128 @@
+services:
+
+  # ── Kafka (KRaft, sin Zookeeper) ──────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: kafkamed-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── MongoDB ───────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    container_name: kafkamed-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Kafka Init — crea el topic antes de que arranquen producer y consumer ──
+  kafka-init:
+    image: apache/kafka:3.7.1
+    container_name: kafkamed-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      /opt/kafka/bin/kafka-topics.sh
+      --bootstrap-server kafka:9092
+      --create --if-not-exists
+      --topic heart-records
+      --partitions 1
+      --replication-factor 1
+    restart: "no"
+
+  # ── Producer Kafka ────────────────────────────────────────────────────────
+  producer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.producer
+    container_name: kafkamed-producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: heart-records
+      PRODUCER_CSV_PATH: /data/heart.csv
+      PRODUCER_INTERVAL_SECONDS: "2"
+      PRODUCER_LOOP: "true"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  # ── Consumer Spark Structured Streaming ───────────────────────────────────
+  consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consumer
+    container_name: kafkamed-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: heart-records
+      SPARK_APP_NAME: KafkaMedConsumer
+      SPARK_CHECKPOINT_PATH: /checkpoints/spark-consumer
+      SPARK_TRIGGER_SECONDS: "5"
+      MODEL_PATH: /artifacts/heart_pipeline.pkl
+      FEATURE_COLUMNS_PATH: /artifacts/feature_columns.json
+      MONGO_URI: mongodb://mongo:27017/
+      MONGO_DB: kafkamed
+      MONGO_COLLECTION: predictions
+    volumes:
+      - ./data:/data:ro
+      - ./artifacts:/artifacts:ro
+      - ./checkpoints:/checkpoints
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      mongo:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── Flask API REST ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: kafkamed-api
+    environment:
+      MONGO_URI: mongodb://mongo:27017/
+      MONGO_DB: kafkamed
+      MONGO_COLLECTION: predictions
+      FLASK_PORT: "5000"
+    ports:
+      - "5000:5000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  kafka_data:
+  mongo_data:
